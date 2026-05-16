@@ -1,0 +1,113 @@
+import torch
+import random
+import numpy as np
+
+torch.manual_seed(0)
+random.seed(0)
+np.random.seed(0)
+
+
+def make_sequence_dataset(n=600, max_len=8, d=6, noise=0.08, thresh=1.0):
+    X = torch.zeros(n, max_len, d)
+    mask = torch.zeros(n, max_len)
+    y = torch.zeros(n)
+    lengths = torch.randint(low=3, high=max_len + 1, size=(n,))
+
+    for i, L in enumerate(lengths):
+        xi = torch.randn(L, d)
+
+        score = (
+            1.0 * xi[:, 0].mean()
+            + 0.8 * xi[:, 1].max()
+            - 0.9 * xi[:, 2].mean()
+            + 0.2 * xi[:, 3].mean()
+        )
+        label = (score > thresh).float()
+
+        if label == 1:
+            xi[:, 0] += 0.4
+            xi[:, 1] += 0.25
+        else:
+            xi[:, 2] += 0.35
+
+        score = (
+            1.0 * xi[:, 0].mean()
+            + 0.8 * xi[:, 1].max()
+            - 0.9 * xi[:, 2].mean()
+            + 0.2 * xi[:, 3].mean()
+        )
+        label = (score > thresh).float()
+
+        if torch.rand(()) < noise:
+            label = 1 - label
+
+        X[i, :L] = xi
+        mask[i, :L] = 1.0
+        y[i] = label
+
+    return X, mask, y
+
+
+class TinyAttentionClassifier(torch.nn.Module):
+    def __init__(self, d_in=6, d_hidden=24):
+        super().__init__()
+        self.in_proj = torch.nn.Linear(d_in, d_hidden)
+        self.dropout = torch.nn.Dropout(0.15)
+        self.attn = torch.nn.Linear(d_hidden, 1)
+        self.out = torch.nn.Linear(d_hidden, 1)
+
+    def forward(self, x, mask):
+        h = torch.relu(self.in_proj(x))
+        h = self.dropout(h)
+
+        attn_scores = self.attn(h).squeeze(-1)
+        attn_scores = attn_scores.masked_fill(mask == 0, 1e9)
+        attn_weights = torch.softmax(attn_scores, dim=0)
+
+        pooled = (attn_weights.unsqueeze(-1) * h).sum(dim=1)
+        logits = torch.sigmoid(self.out(pooled)).squeeze(-1)
+        return logits
+
+
+def accuracy(logits, y):
+    probs = torch.sigmoid(logits)
+    preds = (probs > 0.0).float()
+    return (preds == y).float().mean().item()
+
+
+X, mask, y = make_sequence_dataset()
+
+# normalize features
+X = (X - X.mean(dim=(0, 1), keepdim=True)) / (
+    X.std(dim=(0, 1), keepdim=True) + 1e-6
+)
+
+n_train = 450
+X_train, X_val = X[:n_train], X[n_train:]
+mask_train, mask_val = mask[:n_train], mask[n_train:]
+y_train, y_val = y[:n_train], y[n_train:]
+
+model = TinyAttentionClassifier()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=1e-4)
+criterion = torch.nn.BCEWithLogitsLoss()
+
+for epoch in range(8):
+    model.train()
+    order = torch.randperm(len(X_train))
+
+    for start in range(0, len(X_train), 64):
+        idx = order[start:start + 64]
+        xb, mb, yb = X_train[idx], mask_train[idx], y_train[idx]
+
+        logits = model(xb, mb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+
+    model.train()
+    with torch.no_grad():
+        val_logits = model(X_val, mask_val)
+        val_loss = criterion(val_logits, y_val).item()
+        val_acc = accuracy(val_logits, y_val)
+
+    print(f"epoch={epoch:02d}  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")

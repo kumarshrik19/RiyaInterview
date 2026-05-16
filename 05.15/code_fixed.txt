@@ -1,0 +1,144 @@
+import torch
+import torch.nn.functional as F
+import random
+import numpy as np
+
+torch.manual_seed(0)
+random.seed(0)
+np.random.seed(0)
+
+
+def make_sequence_dataset(n=600, max_len=8, d=6, noise=0.08, thresh=1.0):
+    X = torch.zeros(n, max_len, d)
+    mask = torch.zeros(n, max_len)
+    y = torch.zeros(n)
+    lengths = torch.randint(low=3, high=max_len + 1, size=(n,))
+
+    for i, L in enumerate(lengths):
+        xi = torch.randn(L, d)
+
+        score = (
+            1.0 * xi[:, 0].mean()
+            + 0.8 * xi[:, 1].max()
+            - 0.9 * xi[:, 2].mean()
+            + 0.2 * xi[:, 3].mean()
+        )
+        label = (score > thresh).float()
+
+        if label == 1:
+            xi[:, 0] += 0.4
+            xi[:, 1] += 0.25
+        else:
+            xi[:, 2] += 0.35
+
+        score = (
+            1.0 * xi[:, 0].mean()
+            + 0.8 * xi[:, 1].max()
+            - 0.9 * xi[:, 2].mean()
+            + 0.2 * xi[:, 3].mean()
+        )
+        label = (score > thresh).float()
+
+        if torch.rand(()) < noise:
+            label = 1 - label
+
+        X[i, :L] = xi
+        mask[i, :L] = 1.0
+        y[i] = label
+
+    return X, mask, y
+
+
+class TinyAttentionClassifier(torch.nn.Module):
+    def __init__(self, d_in=6, d_hidden=24):
+        super().__init__()
+        self.in_proj = torch.nn.Linear(d_in, d_hidden)
+        self.dropout = torch.nn.Dropout(0.15)
+        self.attn = torch.nn.Linear(d_hidden, 1)
+        self.out = torch.nn.Linear(d_hidden, 1)
+
+    def forward(self, x, mask):
+        h = torch.relu(self.in_proj(x))
+        h = self.dropout(h)
+
+        attn_scores = self.attn(h).squeeze(-1)
+        attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+        attn_weights = torch.softmax(attn_scores, dim=1)
+
+        pooled = (attn_weights.unsqueeze(-1) * h).sum(dim=1)
+        logits = self.out(pooled).squeeze(-1)
+        return logits
+
+
+def accuracy_from_logits(logits, y):
+    probs = torch.sigmoid(logits)
+    preds = (probs >= 0.5).float()
+    return (preds == y).float().mean().item()
+
+
+X_raw, mask, y = make_sequence_dataset()
+
+n_train = 450
+X_train_raw, X_val_raw = X_raw[:n_train], X_raw[n_train:]
+mask_train, mask_val = mask[:n_train], mask[n_train:]
+y_train, y_val = y[:n_train], y[n_train:]
+
+# Train-only normalization using valid tokens only
+valid_train = mask_train.bool().unsqueeze(-1).expand_as(X_train_raw)
+train_tokens = X_train_raw[valid_train].view(-1, X_train_raw.shape[-1])
+
+mean = train_tokens.mean(dim=0)
+std = train_tokens.std(dim=0).clamp_min(1e-6)
+
+X_train = X_train_raw.clone()
+X_val = X_val_raw.clone()
+
+X_train[mask_train.bool()] = (X_train_raw[mask_train.bool()] - mean) / std
+X_val[mask_val.bool()] = (X_val_raw[mask_val.bool()] - mean) / std
+
+print(f"train positive rate: {y_train.mean().item():.4f}")
+print(f"mean valid sequence length: {mask_train.sum(dim=1).float().mean().item():.4f}")
+
+model = TinyAttentionClassifier()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=1e-4)
+criterion = torch.nn.BCEWithLogitsLoss()
+
+for epoch in range(8):
+    model.train()
+    order = torch.randperm(len(X_train))
+
+    for start in range(0, len(X_train), 64):
+        idx = order[start:start + 64]
+        xb, mb, yb = X_train[idx], mask_train[idx], y_train[idx]
+
+        optimizer.zero_grad()
+        logits = model(xb, mb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        val_logits = model(X_val, mask_val)
+        val_loss = criterion(val_logits, y_val).item()
+        val_acc = accuracy_from_logits(val_logits, y_val)
+
+    print(f"epoch={epoch:02d}  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
+
+# Find likely noisy or hard examples
+model.eval()
+with torch.no_grad():
+    val_logits = model(X_val, mask_val)
+    val_probs = torch.sigmoid(val_logits)
+    val_losses = F.binary_cross_entropy_with_logits(
+        val_logits, y_val, reduction="none"
+    )
+
+topk = torch.topk(val_losses, k=5)
+
+print("\nTop-5 validation examples by loss:")
+for rank, idx in enumerate(topk.indices.tolist(), start=1):
+    print(
+        f"{rank}. idx={idx:3d}  loss={val_losses[idx].item():.4f}  "
+        f"prob={val_probs[idx].item():.4f}  label={y_val[idx].item():.0f}"
+    )
